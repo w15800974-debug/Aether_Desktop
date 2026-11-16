@@ -1,69 +1,53 @@
-//! معادل ویندوزیِ `vpn/AetherVpnService.kt` + `core/HevTunnel.kt`.
+//! Tunnel interface management (Windows Wintun / Linux TUN).
 //!
-//! در اندروید:  VpnService.Builder → دسکریپتور TUN → hev-socks5-tunnel → SOCKS5 موتور
-//! در ویندوز:   Wintun adapter    → نشست Wintun    → ipstack        → SOCKS5 موتور
-//!
-//! رفتارهای امنیتی ۱.۲.۲ که باید عیناً حفظ شوند:
-//!   * DNS اجباراً از داخل تونل می‌رود و پیش از اعلام «متصل» راستی‌آزمایی می‌شود.
-//!   * Split tunnelling پیش‌فرض خاموش است.
-//!   * MTU پیش‌فرض 1280.
-//!
-//! # اصلاح ۱.۲.۰ — لاگی که دروغ می‌گفت
-//! تا ۱.۱.۰ این فایل بی‌قید‌و‌شرط می‌نوشت:
-//!   «Default routes captured: 0.0.0.0/0 and ::/0»
-//! در حالی که هیچ آدرس، مسیر یا DNS ای واقعاً نصب نمی‌شد — فقط یک آداپتور
-//! Wintun ساخته می‌شد. همین سطرِ نادرست باعث شد نشتی WebRTC ماه‌ها در لاگ
-//! نامرئی بماند: کاربر «مسیر پیش‌فرض گرفته شد» می‌دید ولی UDP همچنان از
-//! کارت فیزیکی بیرون می‌رفت.
-//!
-//! حالا این فایل فقط چیزی را گزارش می‌کند که واقعاً انجام داده است؛ و تا
-//! وقتی رلهٔ فضای‌کاربرِ TUN→SOCKS5 وصل نشده، عمداً مسیر پیش‌فرض را نمی‌گیرد
-//! (گرفتنش بدون رله یعنی سیاه‌چالهٔ کامل ترافیک). مهارِ UDP — یعنی همان چیزی
-//! که جلوی نشت WebRTC را می‌گیرد — بر عهدهٔ `leakguard.rs` است.
+//! On Windows: Wintun adapter -> Wintun session -> system proxy (TCP) + leak guard (UDP).
+//! On Linux (Ubuntu 26.x): `/dev/net/tun` (`aether0`) via `ip tuntap` when running
+//! with CAP_NET_ADMIN/root, gracefully falling back to GNOME/system proxy mode
+//! when running as a regular desktop user.
 
 use crate::log::DiagnosticsLog;
 use crate::profile::{ConnectionProfile, SplitMode};
-use anyhow::{Context, Result};
+#[cfg(windows)]
+use anyhow::Context;
+use anyhow::Result;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// همان آدرس‌های داخلیِ TunnelConfig.kt.
 pub const TUN_IPV4: Ipv4Addr = Ipv4Addr::new(172, 19, 0, 2);
 pub const TUN_IPV6: Ipv6Addr = Ipv6Addr::new(0xfdfe, 0xdcba, 0x9876, 0, 0, 0, 0, 1);
 pub const TUN_DNS_V4: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
 pub const TUN_DNS_V6: Ipv6Addr = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
 
+#[cfg(windows)]
 const ADAPTER_NAME: &str = "Aether";
+#[cfg(windows)]
 const ADAPTER_TYPE: &str = "Aether Tunnel";
-/// GUID ثابت: ویندوز با این GUID همیشه همان آداپتور را بازشناسی می‌کند،
-/// پس تنظیمات شبکهٔ کاربر بین اجراها پاک نمی‌شود.
+#[cfg(windows)]
 const ADAPTER_GUID: u128 = 0x7f1e_3c22_9a54_4d61_b0f3_9c2e_1a8d_47b5;
 
+#[cfg(not(windows))]
+const LINUX_TUN_NAME: &str = "aether0";
+
+#[cfg(windows)]
 pub struct Tunnel {
     adapter: Arc<wintun::Adapter>,
     session: Option<Arc<wintun::Session>>,
-    /// معادل شمارنده‌های TrafficPanel.kt (دریافت/ارسال).
     rx: Arc<AtomicU64>,
     tx: Arc<AtomicU64>,
 }
 
+#[cfg(not(windows))]
+pub struct Tunnel {
+    created_dev: bool,
+    rx: Arc<AtomicU64>,
+    tx: Arc<AtomicU64>,
+}
+
+#[cfg(windows)]
 impl Tunnel {
-    /// معادل `VpnService.Builder.establish()`.
-    ///
-    /// نیازمند دسترسی Administrator است — دقیقاً معادل دیالوگ مجوز VPN
-    /// در اندروید. برنامه در صورت نیاز خودش درخواست ارتقا می‌دهد.
     pub fn establish(profile: &ConnectionProfile, wintun_dll: &std::path::Path) -> Result<Self> {
-        // AETHER-APP-FIX wintun-root-cause (1.4.0): the old code printed
-        // "administrator rights required" for EVERY failure -- even though the
-        // manifest is requireAdministrator -- and `{e}` hid the real OS error.
-        // Now: (1) the DLL must exist and load; (2) an adapter left over from a
-        // previous/crashed session is REUSED (Wintun refuses to create a second
-        // one with the same name -> ERROR_ALREADY_EXISTS); (3) creation is
-        // retried because the driver install races with SetupAPI right after
-        // boot/update; (4) the final error carries the whole cause chain, the
-        // raw OS code and the real elevation state.
         if !wintun_dll.is_file() {
             anyhow::bail!("wintun.dll not found at {}", wintun_dll.display());
         }
@@ -92,7 +76,6 @@ impl Tunnel {
                             );
                             last = Some(e);
                             std::thread::sleep(std::time::Duration::from_millis(400));
-                            // The adapter may have appeared meanwhile.
                             if let Ok(a) = wintun::Adapter::open(&lib, ADAPTER_NAME) {
                                 made = Some(a);
                                 break;
@@ -114,23 +97,6 @@ impl Tunnel {
             }
         };
 
-        // ۱.۲.۵-perf — ظرفیتِ رینگ از بزرگ‌ترین مقدارِ ممکن به کوچک‌ترین آمد.
-        //
-        // `MAX_RING_CAPACITY` بزرگ‌ترین ظرفیتی است که Wintun می‌پذیرد و برای
-        // *هر جهت* یک بافر جدا تخصیص می‌شود. سؤال درست این نبود که «چقدر
-        // بگیریم» بلکه این بود که «چه کسی از آن می‌خواند» — و پاسخ، در تمامِ
-        // `src-tauri/src/`، هیچ‌کس است: تنها راهِ رسیدن به نشست، `session()`
-        // است و هیچ فراخوانی‌ای برای آن وجود ندارد؛ نه حلقهٔ خواندنی هست، نه
-        // `receive_blocking`ی.
-        //
-        // و این اتفاقی نیست: خودِ همین فایل چند سطر پایین‌تر می‌گوید مسیر
-        // دادهٔ فعلی پروکسی سیستمی (TCP) است و مسیر پیش‌فرض گرفته نمی‌شود.
-        // آداپتور فقط برای آدرس و DNS داخلی بالا می‌آید. پس آن بافرها حافظه‌ای
-        // بودند که گرفته می‌شد، پُر می‌شد (آداپتور آدرس دارد، پس ویندوز به آن
-        // بسته تحویل می‌دهد) و هرگز تخلیه نمی‌شد.
-        //
-        // کوچک‌ترین ظرفیت و نه حذفِ کاملِ نشست: `session()` یک API عمومی است و
-        // برداشتنش تصمیمِ دیگری است. رجوع به یادداشتِ بالای این فایل.
         let session = adapter
             .start_session(wintun::MIN_RING_CAPACITY)
             .context("could not start the Wintun session")?;
@@ -154,13 +120,7 @@ impl Tunnel {
         Ok(me)
     }
 
-    /// معادل `addAddress` / `addRoute` / `addDnsServer` / `addDisallowedApplication`.
-    ///
-    /// فقط کارهایی انجام و گزارش می‌شود که واقعاً روی سیستم اثر دارند.
     fn configure_routes(&self, profile: &ConnectionProfile) -> Result<()> {
-        // آدرس داخلی و DNS آداپتور — بی‌خطر و برگشت‌پذیر (آداپتور با پایان
-        // نشست از بین می‌رود). به دسترسی Administrator نیاز دارد؛ شکستش
-        // کشنده نیست، فقط صادقانه لاگ می‌شود.
         let addr_ok = netsh(&[
             "interface",
             "ipv4",
@@ -187,53 +147,12 @@ impl Tunnel {
             &format!(
                 "Adapter address {}: {} · in-tunnel DNS {}: {}",
                 TUN_IPV4,
-                if addr_ok {
-                    "applied"
-                } else {
-                    "not applied (needs administrator)"
-                },
+                if addr_ok { "applied" } else { "not applied (needs administrator)" },
                 TUN_DNS_V4,
-                if dns_ok {
-                    "applied"
-                } else {
-                    "not applied (needs administrator)"
-                },
+                if dns_ok { "applied" } else { "not applied (needs administrator)" },
             ),
         );
-
-        // ⚠ صداقت: مسیر پیش‌فرض گرفته نمی‌شود. مسیر دادهٔ فعلی پروکسی سیستمی
-        // است (TCP)، و نصب 0.0.0.0/0 روی آداپتوری که رله ندارد یعنی قطع کامل
-        // اینترنت. مهار UDP با گارد نشتی انجام می‌شود، نه با یک لاگ خوش‌بینانه.
-        DiagnosticsLog::i(
-            "tun",
-            "Default routes NOT captured — data path is the system proxy (TCP). UDP containment is handled by the leak guard.",
-        );
-        if profile.ipv6_protection {
-            DiagnosticsLog::i("tun", "IPv6 protection: global unicast is forced through the protected path or blocked by the kill-switch — no IPv6 leak.");
-        } else {
-            DiagnosticsLog::w(
-                "tun",
-                "IPv6 is enabled in the profile: IPv6 egress is left open, so only IPv4 is covered by the proxy path.",
-            );
-        }
-
-        match profile.split_mode {
-            SplitMode::Off => DiagnosticsLog::i("tun", "Split tunnelling: off (default)"),
-            SplitMode::Include => DiagnosticsLog::i(
-                "tun",
-                &format!(
-                    "Split tunnelling: only {} go through the tunnel",
-                    profile.split_apps.len()
-                ),
-            ),
-            SplitMode::Exclude => DiagnosticsLog::i(
-                "tun",
-                &format!(
-                    "Split tunnelling: {} bypass the tunnel",
-                    profile.split_apps.len()
-                ),
-            ),
-        }
+        log_route_summary(profile);
         Ok(())
     }
 
@@ -241,7 +160,6 @@ impl Tunnel {
         self.session.clone()
     }
 
-    /// بایت‌های دریافتی و ارسالی — همان عددهایی که پنل ترافیک نشان می‌دهد.
     pub fn counters(&self) -> (u64, u64) {
         (
             self.rx.load(Ordering::Relaxed),
@@ -249,19 +167,73 @@ impl Tunnel {
         )
     }
 
-    /// معادل teardown در `AetherVpnService`.
-    ///
-    /// ترتیب عمداً همان ترتیبی است که در ۱.۲.۲ معکوس شد تا فریز ۳۰–۵۰ ثانیه‌ای
-    /// موقع قطع اتصال رفع شود: اول کنسل، بعد کشتن نیتیوها، بعد UI به idle،
-    /// و در آخر جمع‌کردن خارج از مسیر بحرانی.
     pub fn close(&mut self) {
-        // `Drop` هم همین را صدا می‌زند، پس بارِ دوم باید ساکت باشد: در لاگِ
-        // ۱۶ سپتامبر «Wintun adapter torn down» دوبار در یک میلی‌ثانیه چاپ شد،
-        // یک‌بار از این‌جا و یک‌بار از Drop، و خواندنِ لاگ را گمراه می‌کرد.
         let had_session = self.session.take().is_some();
         let _ = self.adapter.get_luid();
         if had_session {
             DiagnosticsLog::i("tun", "Wintun adapter torn down");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl Tunnel {
+    pub fn establish(profile: &ConnectionProfile, _wintun_dll: &std::path::Path) -> Result<Self> {
+        let tun_dev = std::path::Path::new("/dev/net/tun").exists();
+        let mut created_dev = false;
+
+        if tun_dev && crate::diagnostics::is_elevated() {
+            let _ = ip_cmd(&["link", "delete", LINUX_TUN_NAME]);
+            let added = ip_cmd(&["tuntap", "add", "dev", LINUX_TUN_NAME, "mode", "tun"]);
+            if added {
+                let addr = format!("{TUN_IPV4}/24");
+                let mtu_s = profile.mtu.to_string();
+                let addr_ok = ip_cmd(&["addr", "replace", &addr, "dev", LINUX_TUN_NAME]);
+                let up_ok = ip_cmd(&["link", "set", "dev", LINUX_TUN_NAME, "mtu", &mtu_s, "up"]);
+                created_dev = addr_ok && up_ok;
+                if created_dev {
+                    DiagnosticsLog::i(
+                        "tun",
+                        &format!(
+                            "Linux TUN interface {LINUX_TUN_NAME} up ({addr}, mtu={} / default {})",
+                            profile.mtu,
+                            crate::profile::DEFAULT_MTU
+                        ),
+                    );
+                }
+            }
+        } else if tun_dev {
+            DiagnosticsLog::i(
+                "tun",
+                "Linux /dev/net/tun present; running unprivileged — using GNOME/system proxy data path.",
+            );
+        } else {
+            DiagnosticsLog::w(
+                "tun",
+                "/dev/net/tun not available — using Linux system proxy data path.",
+            );
+        }
+
+        log_route_summary(profile);
+        Ok(Self {
+            created_dev,
+            rx: Arc::new(AtomicU64::new(0)),
+            tx: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    pub fn counters(&self) -> (u64, u64) {
+        (
+            self.rx.load(Ordering::Relaxed),
+            self.tx.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn close(&mut self) {
+        if self.created_dev {
+            self.created_dev = false;
+            let _ = ip_cmd(&["link", "delete", LINUX_TUN_NAME]);
+            DiagnosticsLog::i("tun", &format!("Linux TUN interface {LINUX_TUN_NAME} torn down"));
         }
     }
 }
@@ -272,7 +244,48 @@ impl Drop for Tunnel {
     }
 }
 
-/// Pulls N out of an `... (os error N)` Display string (std::io::Error format).
+fn log_route_summary(profile: &ConnectionProfile) {
+    DiagnosticsLog::i(
+        "tun",
+        "Default routes NOT captured — data path is the system proxy (TCP). UDP containment is handled by the leak guard.",
+    );
+    if profile.ipv6_protection {
+        DiagnosticsLog::i("tun", "IPv6 protection: global unicast is forced through the protected path or blocked by the kill-switch — no IPv6 leak.");
+    } else {
+        DiagnosticsLog::w(
+            "tun",
+            "IPv6 is enabled in the profile: IPv6 egress is left open, so only IPv4 is covered by the proxy path.",
+        );
+    }
+
+    match profile.split_mode {
+        SplitMode::Off => DiagnosticsLog::i("tun", "Split tunnelling: off (default)"),
+        SplitMode::Include => DiagnosticsLog::i(
+            "tun",
+            &format!(
+                "Split tunnelling: only {} go through the tunnel",
+                profile.split_apps.len()
+            ),
+        ),
+        SplitMode::Exclude => DiagnosticsLog::i(
+            "tun",
+            &format!(
+                "Split tunnelling: {} bypass the tunnel",
+                profile.split_apps.len()
+            ),
+        ),
+    }
+}
+
+#[cfg(not(windows))]
+fn ip_cmd(args: &[&str]) -> bool {
+    Command::new("ip")
+        .args(args)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub fn os_code_of(text: &str) -> i32 {
     text.rsplit("(os error ")
         .next()
@@ -282,8 +295,6 @@ pub fn os_code_of(text: &str) -> i32 {
         .unwrap_or(0)
 }
 
-/// Honest failure text: names the elevation state and the raw error instead of
-/// always blaming administrator rights. Pure function -> unit-testable.
 pub fn describe_create_failure(err: &str, os_code: i32, elevated: bool) -> String {
     let hint = if !elevated {
         "the process is NOT elevated - run Aether as administrator"
@@ -297,11 +308,9 @@ pub fn describe_create_failure(err: &str, os_code: i32, elevated: bool) -> Strin
     format!("could not create the Wintun adapter: {err} (os error {os_code}, elevated={elevated}) - {hint}")
 }
 
-/// اجرای یک دستور netsh بدون بازکردن پنجرهٔ کنسول.
+#[cfg(windows)]
 fn netsh(args: &[&str]) -> bool {
-    #[cfg(windows)]
     use std::os::windows::process::CommandExt;
-    #[cfg(windows)]
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let mut cmd = Command::new(
@@ -310,7 +319,6 @@ fn netsh(args: &[&str]) -> bool {
             .join("netsh.exe"),
     );
     cmd.args(args);
-    #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.output().map(|o| o.status.success()).unwrap_or(false)
 }

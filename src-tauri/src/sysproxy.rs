@@ -1,23 +1,10 @@
-//! پروکسی سیستمی ویندوز — معادل کاربردیِ `VpnService.establish()` اندروید.
+//! System proxy integration (Windows WinINET / Linux GNOME & KDE).
 //!
-//! ریشهٔ باگ «کانکت می‌شود ولی هیچ سایتی باز نمی‌شود»: نسخهٔ قبلی دسکتاپ
-//! هیچ مسیر داده‌ای بین سیستم و SOCKS5 موتور برقرار نمی‌کرد (Wintun فقط
-//! ساخته می‌شد؛ نه مسیریابی داشت و نه رله). حالا هنگام اتصال:
-//!   ۱. پل محلی HTTP↔SOCKS5 (`share.rs`) روی 127.0.0.1:10811 بالا می‌آید،
-//!   ۲. پروکسی سیستمی ویندوز (WinINET — همان که Edge/Chrome/Firefox
-//!      «system proxy» می‌خوانند) به آن پل تنظیم می‌شود،
-//!   ۳. هنگام قطع، تنظیم برگردانده می‌شود.
-//! این کار به دسترسی Administrator نیاز ندارد (HKCU) و همان نقش «کل
-//! ترافیک از تونل برود» اندروید را روی ویندوز بازی می‌کند.
-//!
-//! ⚠ محدودیت ذاتی که ریشهٔ نشتی WebRTC بود: پروکسی WinINET **فقط TCP** را
-//! می‌گیرد. هر سوکت UDP خامی (WebRTC/STUN، QUIC، بازی‌ها) از کنارش رد
-//! می‌شود. جبرانش در `leakguard.rs` است و اعلام «متصل» دیگر به‌تنهایی معنی
-//! «بدون نشتی» نمی‌دهد؛ خودآزما آن را جداگانه اثبات می‌کند.
-//!
-//! v1.2.0: رشتهٔ پروکسی به شکل «به‌ازای پروتکل» نوشته می‌شود و یک ورودی
-//! `socks=` هم دارد. مرورگرهای کرومیوم همین ورودی را برمی‌دارند و با SOCKS5
-//! نامِ مقصد را هم داخل تونل حل می‌کنند (بدون نشت DNS).
+//! When connected:
+//!   1. Local HTTP<->SOCKS5 bridge (`share.rs`) listens on 127.0.0.1:10811.
+//!   2. System proxy (WinINET on Windows, `org.gnome.system.proxy` on Ubuntu/GNOME)
+//!      is pointed to the local bridge, after backing up the user's prior settings.
+//!   3. On disconnect, error, or app exit, the exact prior settings are restored.
 
 use crate::log::DiagnosticsLog;
 use parking_lot::Mutex;
@@ -29,10 +16,19 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+#[cfg(windows)]
 const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+#[cfg(windows)]
 const BACKUP_KEY: &str = r"HKCU\Software\Aether\ProxyBackup";
-/// مقصدهایی که هرگز نباید از پروکسی بروند (شبکهٔ محلی و خود لوپ‌بک).
+
+/// Destinations that must never go through the proxy (loopback & LAN).
 const BYPASS: &str = "localhost;127.*;10.*;172.16.*;192.168.*;<local>";
+
+#[cfg(not(windows))]
+const LINUX_IGNORE_HOSTS: &str =
+    "['localhost', '127.0.0.0/8', '::1', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']";
+
+#[cfg(windows)]
 #[derive(Clone, Debug)]
 struct SavedProxy {
     server: Option<String>,
@@ -41,15 +37,33 @@ struct SavedProxy {
     auto_config: Option<String>,
 }
 
+#[cfg(not(windows))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct SavedLinuxProxy {
+    mode: String,
+    http_host: String,
+    http_port: String,
+    https_host: String,
+    https_port: String,
+    socks_host: String,
+    socks_port: String,
+    ignore_hosts: String,
+}
+
+#[cfg(windows)]
 fn saved_proxy() -> &'static Mutex<Option<SavedProxy>> {
     static CELL: OnceLock<Mutex<Option<SavedProxy>>> = OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
 
-/// فعال‌سازی پروکسی سیستمی روی پل محلی. `true` یعنی ثبت شد.
+#[cfg(not(windows))]
+fn saved_linux_proxy() -> &'static Mutex<Option<SavedLinuxProxy>> {
+    static CELL: OnceLock<Mutex<Option<SavedLinuxProxy>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(windows)]
 pub fn enable(http_port: u16, socks_port: u16) -> bool {
-    // Snapshot every value we touch exactly once. Disabling ProxyEnable is not
-    // restoration: it destroys the user's previous proxy/PAC configuration.
     let mut saved = saved_proxy().lock();
     if saved.is_none() {
         *saved = Some(SavedProxy {
@@ -101,27 +115,57 @@ pub fn enable(http_port: u16, socks_port: u16) -> bool {
         "/f",
     ]);
     if !ok {
-        // Never leave a half-written proxy configuration behind.
         let _ = disable();
         return false;
     }
     broadcast_change();
-    if ok {
-        DiagnosticsLog::i(
-            "sysproxy",
-            &format!("System proxy enabled -> {server} (bypass: {BYPASS})"),
-        );
-    } else {
-        DiagnosticsLog::e(
-            "sysproxy",
-            "Could not write the system proxy registry values.",
-        );
-    }
-    ok
+    DiagnosticsLog::i(
+        "sysproxy",
+        &format!("System proxy enabled -> {server} (bypass: {BYPASS})"),
+    );
+    true
 }
 
-/// Recover only an interrupted Aether session. A normal app launch must not
-/// disable an unrelated user proxy, PAC, VPN, or enterprise configuration.
+#[cfg(not(windows))]
+pub fn enable(http_port: u16, socks_port: u16) -> bool {
+    let mut saved = saved_linux_proxy().lock();
+    if saved.is_none() {
+        if let Some(snap) = snapshot_gsettings() {
+            let _ = write_linux_backup(&snap);
+            *saved = Some(snap);
+        }
+    }
+    drop(saved);
+
+    let http_p = http_port.to_string();
+    let socks_p = socks_port.to_string();
+    let ok = gset("org.gnome.system.proxy.http", "host", "'127.0.0.1'")
+        && gset("org.gnome.system.proxy.http", "port", &http_p)
+        && gset("org.gnome.system.proxy.https", "host", "'127.0.0.1'")
+        && gset("org.gnome.system.proxy.https", "port", &http_p)
+        && gset("org.gnome.system.proxy.socks", "host", "'127.0.0.1'")
+        && gset("org.gnome.system.proxy.socks", "port", &socks_p)
+        && gset("org.gnome.system.proxy", "ignore-hosts", LINUX_IGNORE_HOSTS)
+        && gset("org.gnome.system.proxy", "mode", "'manual'");
+
+    if !ok {
+        let _ = disable();
+        DiagnosticsLog::w(
+            "sysproxy",
+            "Could not configure GNOME system proxy via gsettings (headless or non-GNOME session).",
+        );
+        return false;
+    }
+    DiagnosticsLog::i(
+        "sysproxy",
+        &format!(
+            "Linux GNOME system proxy enabled -> http/https 127.0.0.1:{http_port}, socks 127.0.0.1:{socks_port}"
+        ),
+    );
+    true
+}
+
+#[cfg(windows)]
 pub fn recover_stale() -> bool {
     let has_backup = load_persistent_backup().is_some();
     let points_to_aether = reg_read("ProxyServer")
@@ -134,7 +178,26 @@ pub fn recover_stale() -> bool {
     }
 }
 
-/// غیرفعال‌سازی پروکسی سیستمی — در قطع اتصال، خطا و خروج برنامه صدا زده می‌شود.
+#[cfg(not(windows))]
+pub fn recover_stale() -> bool {
+    let has_backup = read_linux_backup().is_some();
+    let points_to_aether = gget("org.gnome.system.proxy", "mode")
+        .map(|m| m.contains("manual"))
+        .unwrap_or(false)
+        && gget("org.gnome.system.proxy.http", "host")
+            .map(|h| h.contains("127.0.0.1"))
+            .unwrap_or(false)
+        && gget("org.gnome.system.proxy.http", "port")
+            .map(|p| p.trim() == "10811")
+            .unwrap_or(false);
+    if has_backup || points_to_aether {
+        disable()
+    } else {
+        true
+    }
+}
+
+#[cfg(windows)]
 pub fn disable() -> bool {
     let snapshot = saved_proxy().lock().take().or_else(load_persistent_backup);
     let had_snapshot = snapshot.is_some();
@@ -146,8 +209,6 @@ pub fn disable() -> bool {
                 && restore_value("AutoConfigURL", previous.auto_config)
         }
         None => {
-            // Crash recovery for builds that predate the persistent backup:
-            // only touch a proxy that unmistakably points at Aether's bridge.
             let stale = reg_read("ProxyServer")
                 .map(|v| v.contains("127.0.0.1:10811"))
                 .unwrap_or(false);
@@ -187,12 +248,122 @@ pub fn disable() -> bool {
     ok
 }
 
-/// رشتهٔ پروکسی WinINET به شکل «به‌ازای پروتکل».
-/// HTTP/HTTPS از پل HTTP می‌روند و SOCKS5 برای برنامه‌هایی که آن را می‌فهمند.
+#[cfg(not(windows))]
+pub fn disable() -> bool {
+    let snapshot = saved_linux_proxy().lock().take().or_else(read_linux_backup);
+    let had_snapshot = snapshot.is_some();
+    let ok = match snapshot {
+        Some(prev) => {
+            gset("org.gnome.system.proxy.http", "host", &prev.http_host)
+                && gset("org.gnome.system.proxy.http", "port", &prev.http_port)
+                && gset("org.gnome.system.proxy.https", "host", &prev.https_host)
+                && gset("org.gnome.system.proxy.https", "port", &prev.https_port)
+                && gset("org.gnome.system.proxy.socks", "host", &prev.socks_host)
+                && gset("org.gnome.system.proxy.socks", "port", &prev.socks_port)
+                && gset("org.gnome.system.proxy", "ignore-hosts", &prev.ignore_hosts)
+                && gset("org.gnome.system.proxy", "mode", &prev.mode)
+        }
+        None => {
+            let stale = gget("org.gnome.system.proxy.http", "host")
+                .map(|h| h.contains("127.0.0.1"))
+                .unwrap_or(false)
+                && gget("org.gnome.system.proxy.http", "port")
+                    .map(|p| p.trim() == "10811")
+                    .unwrap_or(false);
+            if stale {
+                gset("org.gnome.system.proxy", "mode", "'none'")
+            } else {
+                true
+            }
+        }
+    };
+    if ok && had_snapshot {
+        remove_linux_backup();
+    }
+    if ok {
+        DiagnosticsLog::i(
+            "sysproxy",
+            "Linux system proxy settings restored to their pre-Aether state.",
+        );
+    }
+    ok
+}
+
+#[allow(dead_code)]
 fn proxy_string(http_port: u16, socks_port: u16) -> String {
     format!("http=127.0.0.1:{http_port};https=127.0.0.1:{http_port};socks=127.0.0.1:{socks_port}")
 }
 
+#[cfg(not(windows))]
+fn linux_backup_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("studio.cluvex.aether.desktop").join("proxy-backup.json"))
+}
+
+#[cfg(not(windows))]
+fn write_linux_backup(snap: &SavedLinuxProxy) -> std::io::Result<()> {
+    let Some(path) = linux_backup_path() else {
+        return Ok(());
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let json = serde_json::to_vec(snap).unwrap_or_default();
+    std::fs::write(path, json)
+}
+
+#[cfg(not(windows))]
+fn read_linux_backup() -> Option<SavedLinuxProxy> {
+    let path = linux_backup_path()?;
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+#[cfg(not(windows))]
+fn remove_linux_backup() {
+    if let Some(path) = linux_backup_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(not(windows))]
+fn snapshot_gsettings() -> Option<SavedLinuxProxy> {
+    Some(SavedLinuxProxy {
+        mode: gget("org.gnome.system.proxy", "mode")?,
+        http_host: gget("org.gnome.system.proxy.http", "host")?,
+        http_port: gget("org.gnome.system.proxy.http", "port")?,
+        https_host: gget("org.gnome.system.proxy.https", "host")?,
+        https_port: gget("org.gnome.system.proxy.https", "port")?,
+        socks_host: gget("org.gnome.system.proxy.socks", "host")?,
+        socks_port: gget("org.gnome.system.proxy.socks", "port")?,
+        ignore_hosts: gget("org.gnome.system.proxy", "ignore-hosts")?,
+    })
+}
+
+#[cfg(not(windows))]
+fn gget(schema: &str, key: &str) -> Option<String> {
+    let out = Command::new("gsettings")
+        .args(["get", schema, key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[cfg(not(windows))]
+fn gset(schema: &str, key: &str, value: &str) -> bool {
+    Command::new("gsettings")
+        .args(["set", schema, key, value])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
 fn backup_write(name: &str, value: Option<&str>) {
     if let Some(value) = value {
         let _ = reg(&[
@@ -201,6 +372,7 @@ fn backup_write(name: &str, value: Option<&str>) {
     }
 }
 
+#[cfg(windows)]
 fn load_persistent_backup() -> Option<SavedProxy> {
     if reg_read_backup("AetherActive").is_none() {
         return None;
@@ -213,6 +385,7 @@ fn load_persistent_backup() -> Option<SavedProxy> {
     })
 }
 
+#[cfg(windows)]
 fn reg_read_backup(name: &str) -> Option<String> {
     let output = reg_output(&["query", BACKUP_KEY, "/v", name])?;
     output.lines().find_map(|line| {
@@ -226,6 +399,7 @@ fn reg_read_backup(name: &str) -> Option<String> {
     })
 }
 
+#[cfg(windows)]
 fn reg_read(name: &str) -> Option<String> {
     let output = reg_output(&["query", KEY, "/v", name])?;
     output.lines().find_map(|line| {
@@ -240,6 +414,7 @@ fn reg_read(name: &str) -> Option<String> {
     })
 }
 
+#[cfg(windows)]
 fn restore_value(name: &str, encoded: Option<String>) -> bool {
     match encoded {
         Some(raw) => {
@@ -252,14 +427,17 @@ fn restore_value(name: &str, encoded: Option<String>) -> bool {
     }
 }
 
+#[cfg(windows)]
 fn reg_missing_ok() -> bool {
     true
 }
 
+#[cfg(windows)]
 fn reg_delete(name: &str) -> bool {
     reg(&["delete", KEY, "/v", name, "/f"]) || reg_missing_ok()
 }
 
+#[cfg(windows)]
 fn reg_output(args: &[&str]) -> Option<String> {
     let mut cmd = Command::new(
         std::path::Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
@@ -267,7 +445,6 @@ fn reg_output(args: &[&str]) -> Option<String> {
             .join("reg.exe"),
     );
     cmd.args(args);
-    #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     let out = cmd.output().ok()?;
     if !out.status.success() {
@@ -276,6 +453,7 @@ fn reg_output(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+#[cfg(windows)]
 fn reg(args: &[&str]) -> bool {
     let mut cmd = Command::new(
         std::path::Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
@@ -283,14 +461,10 @@ fn reg(args: &[&str]) -> bool {
             .join("reg.exe"),
     );
     cmd.args(args);
-    #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.status().map(|s| s.success()).unwrap_or(false)
 }
 
-/// به WinINET اعلام می‌کند تنظیمات پروکسی عوض شد تا برنامه‌های باز (مرورگرها)
-/// بدون ری‌استارت آن را بردارند — بدون این فراخوان، تغییر تا اجرای بعدی
-/// برنامه‌ها دیده نمی‌شد.
 #[cfg(windows)]
 fn broadcast_change() {
     const INTERNET_OPTION_REFRESH: u32 = 37;
@@ -320,9 +494,6 @@ fn broadcast_change() {
     }
 }
 
-#[cfg(not(windows))]
-fn broadcast_change() {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,7 +506,6 @@ mod tests {
         assert!(s.contains("socks=127.0.0.1:10810"));
     }
 
-    /// لوپ‌بک و شبکهٔ محلی هرگز نباید از پروکسی بروند.
     #[test]
     fn bypass_keeps_loopback_and_lan_direct() {
         for needle in ["localhost", "127.*", "<local>"] {

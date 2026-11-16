@@ -1,7 +1,7 @@
 [package]
 name = "aether-desktop"
 version = "1.4.0"
-description = "Aether Desktop - Windows edition"
+description = "Aether Desktop - Linux & Windows edition"
 authors = ["Cluvex Studio"]
 edition = "2021"
 rust-version = "1.77"
@@ -18,8 +18,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 parking_lot = "0.12"
-# Wintun — معادل ویندوزیِ VpnService + hev-tun در اندروید
-wintun = "0.5"
 # ۱.۲.۵-perf — `ipstack` و `tokio` از این‌جا برداشته شدند.
 #
 # هیچ‌یک در `src-tauri/src/` استفاده نمی‌شد: تنها اشارهٔ `ipstack` یک کامنت در
@@ -39,6 +37,8 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 zeroize = "1"
 
 [target.'cfg(windows)'.dependencies]
+# Wintun — معادل ویندوزیِ VpnService + hev-tun در اندروید
+wintun = "0.5"
 windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_NetworkManagement_IpHelper",

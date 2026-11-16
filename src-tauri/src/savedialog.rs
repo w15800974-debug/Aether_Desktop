@@ -1,8 +1,7 @@
-//! Native Windows "Save as" dialog for exported profiles.
+//! Native "Save as" dialog for exported profiles.
 //!
-//! The webview's `<a download>` trick shows no dialog in WebView2 (the file is
-//! saved silently or not at all), so the choice of folder and name is made
-//! here with the shell's `IFileSaveDialog`. Returns `Ok(None)` on Cancel.
+//! On Windows, uses `IFileSaveDialog`.
+//! On Linux (Ubuntu / GNOME / KDE), uses `zenity` or `kdialog`.
 use std::path::PathBuf;
 
 #[cfg(windows)]
@@ -47,6 +46,41 @@ pub fn pick_save_path(owner: isize, suggested: &str) -> Result<Option<PathBuf>, 
 }
 
 #[cfg(not(windows))]
-pub fn pick_save_path(_owner: isize, _suggested: &str) -> Result<Option<PathBuf>, String> {
-    Err("Save dialog is only available on Windows".into())
+pub fn pick_save_path(_owner: isize, suggested: &str) -> Result<Option<PathBuf>, String> {
+    use std::process::Command;
+
+    if let Ok(out) = Command::new("zenity")
+        .args([
+            "--file-selection",
+            "--save",
+            "--confirm-overwrite",
+            "--title=Save Aether Profile",
+            &format!("--filename={suggested}"),
+            "--file-filter=JSON files (*.json) | *.json",
+        ])
+        .output()
+    {
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            return Ok(if path.is_empty() { None } else { Some(PathBuf::from(path)) });
+        }
+        if out.status.code() == Some(1) {
+            return Ok(None);
+        }
+    }
+
+    if let Ok(out) = Command::new("kdialog")
+        .args(["--getsavefilename", suggested, "*.json |JSON files"])
+        .output()
+    {
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            return Ok(if path.is_empty() { None } else { Some(PathBuf::from(path)) });
+        }
+        if out.status.code() == Some(1) {
+            return Ok(None);
+        }
+    }
+
+    Err("No native Linux save dialog found (install zenity or kdialog)".into())
 }
