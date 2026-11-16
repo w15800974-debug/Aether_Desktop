@@ -43,17 +43,10 @@ impl SecretStore {
         }
     }
 
-    /// راز را می‌خواند، یا رشتهٔ خالی اگر نبود/باز نشد.
-    ///
-    /// خواندن هرگز خطا نمی‌دهد — دقیقاً مثل `ProfileStore::load`. فایلِ
-    /// باز‌نشدنی (پروفایل ویندوزِ عوض‌شده، دیسکِ کپی‌شده به ماشین دیگر) یعنی
-    /// «کلیدی نداریم»، و رابط کاربری همان مسیر «کلید وارد کنید» را نشان می‌دهد
-    /// که یک نصبِ تازه می‌بیند.
     pub fn read(&self, name: &str) -> String {
         self.read_all().get(name).cloned().unwrap_or_default()
     }
 
-    /// راز را می‌نویسد. مقدار خالی یعنی فراموش‌کردنِ آن.
     pub fn write(&self, name: &str, value: &str) -> Result<()> {
         let mut all = self.read_all();
         let trimmed = value.trim();
@@ -73,7 +66,6 @@ impl SecretStore {
         match unprotect(&sealed) {
             Ok(plain) => serde_json::from_slice(&plain).unwrap_or_default(),
             Err(e) => {
-                // با *محتوا* لاگ نمی‌شود، فقط با علت. این لاگ صادراتی است.
                 DiagnosticsLog::w(
                     "ai",
                     &format!(
@@ -97,25 +89,23 @@ impl SecretStore {
         let sealed = protect(&plain)?;
         let tmp = self.path.with_extension("bin.tmp");
         std::fs::write(&tmp, &sealed)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
 }
 
-// >>> AETHER-APP-PATCH custom-configs-sealed (1.3.0)
-/// همان مهرِ DPAPI برای انبارِ کانفیگ‌های سفارشی (`custom/store.rs`):
-/// اطلاعاتِ ورودِ سرورها هرگز به‌صورتِ متنِ ساده روی دیسک نمی‌نشینند.
 pub(crate) fn seal(plain: &[u8]) -> Result<Vec<u8>> {
     protect(plain)
 }
 
-/// بازکردنِ مهرِ [`seal`].
 pub(crate) fn unseal(sealed: &[u8]) -> Result<Vec<u8>> {
     unprotect(sealed)
 }
-// <<< AETHER-APP-PATCH custom-configs-sealed
-
-// ---------------------------------------------------------------- ویندوز: DPAPI
 
 #[cfg(windows)]
 fn protect(plain: &[u8]) -> Result<Vec<u8>> {
@@ -175,25 +165,90 @@ fn unprotect(sealed: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-// ------------------------------------------------------- غیرویندوز: فقط تست
-//
-// بیلد انتشار همیشه ویندوز است؛ این شاخه فقط برای این وجود دارد که
-// `cargo test` روی یک ماشین توسعهٔ لینوکسی هم اجرا شود. عمداً *مهر نمی‌کند* و
-// همین را در لاگ می‌گوید، تا کسی به اشتباه فکر نکند یک بیلد غیرویندوزی هم
-// حفاظت DPAPI را دارد.
+#[cfg(not(windows))]
+fn linux_seal_key() -> [u8; 32] {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    let mut ikm = Vec::new();
+    if let Ok(mid) = std::fs::read_to_string("/etc/machine-id") {
+        ikm.extend_from_slice(mid.trim().as_bytes());
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        ikm.extend_from_slice(home.as_bytes());
+    }
+    if let Ok(user) = std::env::var("USER") {
+        ikm.extend_from_slice(user.as_bytes());
+    }
+    if ikm.is_empty() {
+        ikm.extend_from_slice(b"aether-linux-fallback-ikm");
+    }
+    let hk = Hkdf::<Sha256>::new(Some(b"AetherDesktop-Linux-SecretStore-v1"), &ikm);
+    let mut key = [0u8; 32];
+    let _ = hk.expand(b"chacha20poly1305-seal", &mut key);
+    key
+}
+
+#[cfg(not(windows))]
+fn linux_random_nonce() -> [u8; 12] {
+    use std::io::Read;
+    let mut nonce = [0u8; 12];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(&mut nonce).is_ok() {
+            return nonce;
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    nonce[..8].copy_from_slice(&nanos.to_le_bytes()[..8]);
+    nonce
+}
+
+#[cfg(not(windows))]
+const LINUX_SEAL_MAGIC: &[u8; 5] = b"AETH1";
 
 #[cfg(not(windows))]
 fn protect(plain: &[u8]) -> Result<Vec<u8>> {
-    DiagnosticsLog::w(
-        "ai",
-        "This is not a Windows build: the secret store is NOT sealed.",
-    );
-    Ok(plain.to_vec())
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    use zeroize::Zeroize;
+
+    let mut key_bytes = linux_seal_key();
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    key_bytes.zeroize();
+
+    let nonce_bytes = linux_random_nonce();
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plain)
+        .map_err(|e| anyhow!("Linux secret store encryption failed: {e}"))?;
+
+    let mut out = Vec::with_capacity(LINUX_SEAL_MAGIC.len() + nonce_bytes.len() + ciphertext.len());
+    out.extend_from_slice(LINUX_SEAL_MAGIC);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
 }
 
 #[cfg(not(windows))]
 fn unprotect(sealed: &[u8]) -> Result<Vec<u8>> {
-    Ok(sealed.to_vec())
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    use zeroize::Zeroize;
+
+    let header = LINUX_SEAL_MAGIC.len() + 12;
+    if sealed.len() < header || &sealed[..5] != LINUX_SEAL_MAGIC {
+        return Err(anyhow!("invalid or unsealed Linux secret store blob"));
+    }
+    let mut key_bytes = linux_seal_key();
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    key_bytes.zeroize();
+
+    let nonce = Nonce::from_slice(&sealed[5..17]);
+    cipher
+        .decrypt(nonce, &sealed[17..])
+        .map_err(|e| anyhow!("Linux secret store decryption failed: {e}"))
 }
 
 #[cfg(test)]
@@ -207,11 +262,9 @@ mod tests {
         let store = SecretStore::new(&dir);
 
         assert_eq!(store.read(GEMINI_KEY), "");
-        // فاصله و newtline‌ای که از کپی‌کردن از یک صفحهٔ وب می‌آید باید برود.
         store.write(GEMINI_KEY, "  AIzaExampleKey \n").unwrap();
         assert_eq!(store.read(GEMINI_KEY), "AIzaExampleKey");
 
-        // مقدار خالی یعنی فراموش کن.
         store.write(GEMINI_KEY, "").unwrap();
         assert_eq!(store.read(GEMINI_KEY), "");
         let _ = std::fs::remove_dir_all(&dir);
