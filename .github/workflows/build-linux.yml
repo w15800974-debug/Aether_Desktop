@@ -1,0 +1,150 @@
+name: Build Linux (Ubuntu .deb & AppImage)
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PSIPHON_VERSION: 83aa73b9b982e7421e00117f5b0c5aceb5dda452
+  LYREBIRD_VERSION: lyrebird-0.6.1
+  XRAY_VERSION: v25.12.8
+  TOR_BUNDLE_VERSION: 14.5.2
+
+jobs:
+  build-linux:
+    name: Build Ubuntu x64 (.deb & AppImage)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ubuntu Tauri & build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            pkg-config \
+            build-essential \
+            cmake \
+            clang \
+            protobuf-compiler \
+            dpkg-dev \
+            curl \
+            unzip \
+            file
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Setup Go 1.24
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Install frontend dependencies & run UI checks
+        run: |
+          npm ci
+          node tests/js-syntax.mjs
+          node tests/i18n-scan-keys.mjs
+          node tests/glow-direction.mjs
+
+      - name: Build Aether Core (Linux x64)
+        run: |
+          mkdir -p dist-engine/xray dist-engine/tor dist-engine/pt
+          cargo build --release \
+            --manifest-path native/aether/aether/Cargo.toml \
+            --target x86_64-unknown-linux-gnu
+          cp native/aether/aether/target/x86_64-unknown-linux-gnu/release/aether dist-engine/aether
+          chmod +x dist-engine/aether
+
+      - name: Build Psiphon Tunnel Core (Linux x64)
+        run: |
+          git clone https://github.com/Psiphon-Labs/psiphon-tunnel-core.git /tmp/psiphon-src
+          git -C /tmp/psiphon-src checkout "${{ env.PSIPHON_VERSION }}"
+          (cd /tmp/psiphon-src/ConsoleClient && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o "${GITHUB_WORKSPACE}/dist-engine/psiphon-tunnel-core" .)
+          chmod +x dist-engine/psiphon-tunnel-core
+          touch dist-engine/server_entries.txt
+          rm -rf /tmp/psiphon-src
+
+      - name: Build lyrebird pluggable transport (Linux x64)
+        run: |
+          git clone --depth 1 --branch "${{ env.LYREBIRD_VERSION }}" https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird.git /tmp/lyrebird-src
+          (cd /tmp/lyrebird-src && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o "${GITHUB_WORKSPACE}/dist-engine/pt/lyrebird" ./cmd/lyrebird)
+          chmod +x dist-engine/pt/lyrebird
+          cat << 'EOF' > dist-engine/pt/pt_config.json
+          {
+            "pluggableTransports": {
+              "lyrebird": "ClientTransportPlugin meek_lite,obfs2,obfs3,obfs4,scramblesuit,webtunnel exec ${pt_path}lyrebird",
+              "snowflake": "ClientTransportPlugin snowflake exec ${pt_path}lyrebird"
+            }
+          }
+          EOF
+          rm -rf /tmp/lyrebird-src
+
+      - name: Stage Xray-core (Linux x64)
+        run: |
+          curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/${{ env.XRAY_VERSION }}/Xray-linux-64.zip" -o /tmp/xray.zip
+          unzip -j -o /tmp/xray.zip xray -d dist-engine/xray/
+          chmod +x dist-engine/xray/xray
+          rm -f /tmp/xray.zip
+
+      - name: Stage Tor Expert Bundle (Linux x64)
+        run: |
+          curl -fsSL "https://archive.torproject.org/tor-package-archive/torbrowser/${{ env.TOR_BUNDLE_VERSION }}/tor-expert-bundle-linux-x86_64-${{ env.TOR_BUNDLE_VERSION }}.tar.gz" -o /tmp/tor.tar.gz
+          tar -xzf /tmp/tor.tar.gz -C /tmp/
+          cp /tmp/tor/tor dist-engine/tor/tor
+          cp /tmp/data/geoip dist-engine/tor/geoip
+          cp /tmp/data/geoip6 dist-engine/tor/geoip6
+          chmod +x dist-engine/tor/tor
+          rm -rf /tmp/tor.tar.gz /tmp/tor /tmp/data
+
+      - name: Run Rust unit tests (Linux)
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Build Tauri Linux packages (.deb & AppImage)
+        run: |
+          export APP_PATCHLEVEL="$(cat PATCHLEVEL 2>/dev/null || echo '1.4.0-linux')"
+          npm run tauri build -- --bundles deb,appimage
+
+      - name: Collect release artifacts & SHA256SUMS
+        run: |
+          mkdir -p release-linux
+          cp src-tauri/target/release/bundle/deb/*.deb release-linux/
+          cp src-tauri/target/release/bundle/appimage/*.AppImage release-linux/ || true
+          (cd release-linux && sha256sum * > SHA256SUMS-linux.txt)
+          ls -lh release-linux/
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aether-linux-ubuntu-x64
+          path: release-linux/*
+          retention-days: 30
