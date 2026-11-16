@@ -8,7 +8,7 @@ cd "$ROOT_DIR"
 PSIPHON_VERSION="${PSIPHON_VERSION:-83aa73b9b982e7421e00117f5b0c5aceb5dda452}"
 LYREBIRD_VERSION="${LYREBIRD_VERSION:-lyrebird-0.6.1}"
 XRAY_VERSION="${XRAY_VERSION:-v25.12.8}"
-TOR_BUNDLE_VERSION="${TOR_BUNDLE_VERSION:-14.5.2}"
+TOR_BUNDLE_VERSION="${TOR_BUNDLE_VERSION:-15.0.23}"
 
 echo "==> Checking Ubuntu build dependencies..."
 for cmd in cargo rustc node npm go curl unzip tar dpkg-deb; do
@@ -30,19 +30,20 @@ chmod +x dist-engine/aether
 echo "==> Building Psiphon Tunnel Core (Linux x64)..."
 if [ ! -x dist-engine/psiphon-tunnel-core ]; then
   TMP_PSI="$(mktemp -d)"
-  git clone https://github.com/Psiphon-Labs/psiphon-tunnel-core.git "$TMP_PSI"
-  git -C "$TMP_PSI" checkout "$PSIPHON_VERSION"
-  (cd "$TMP_PSI/ConsoleClient" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o "$ROOT_DIR/dist-engine/psiphon-tunnel-core" .)
+  git clone --filter=blob:none --no-checkout https://github.com/CluvexStudio/psiphon-tunnel-core.git "$TMP_PSI"
+  git -C "$TMP_PSI" fetch --depth 1 origin "$PSIPHON_VERSION"
+  git -C "$TMP_PSI" checkout --detach "$PSIPHON_VERSION"
+  (cd "$TMP_PSI" && GOFLAGS="-mod=vendor" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$ROOT_DIR/dist-engine/psiphon-tunnel-core" ./ConsoleClient)
   chmod +x dist-engine/psiphon-tunnel-core
   rm -rf "$TMP_PSI"
 fi
-touch dist-engine/server_entries.txt
+cp assets/psiphon/server_entries.txt dist-engine/server_entries.txt
 
 echo "==> Building lyrebird pluggable transport (Linux x64)..."
 if [ ! -x dist-engine/pt/lyrebird ]; then
   TMP_LYR="$(mktemp -d)"
   git clone --depth 1 --branch "$LYREBIRD_VERSION" https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird.git "$TMP_LYR"
-  (cd "$TMP_LYR" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o "${ROOT_DIR}/dist-engine/pt/lyrebird" ./cmd/lyrebird)
+  (cd "$TMP_LYR" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "${ROOT_DIR}/dist-engine/pt/lyrebird" ./cmd/lyrebird)
   chmod +x dist-engine/pt/lyrebird
   rm -rf "$TMP_LYR"
 fi
