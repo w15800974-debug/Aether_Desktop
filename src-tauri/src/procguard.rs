@@ -60,6 +60,13 @@ const OWN_IMAGES: &[&str] = &[
     "snowflake-client.exe",
     "webtunnel-client.exe",
     "conjure-client.exe",
+    "aether",
+    "psiphon-tunnel-core",
+    "tor",
+    "lyrebird",
+    "snowflake-client",
+    "webtunnel-client",
+    "conjure-client",
 ];
 
 /// شناسهٔ فرآیندهای زندهٔ همین نشست — و Job هر کدام.
@@ -88,6 +95,8 @@ pub fn set_own_roots(roots: &[PathBuf]) {
 /// درختِ فرآیندِ یک فرزند. با `terminate` یا `Drop` کلِ درخت می‌میرد.
 pub struct KillTree {
     id: u64,
+    #[cfg(not(windows))]
+    pid: u32,
     #[cfg(windows)]
     job: isize,
 }
@@ -120,6 +129,8 @@ impl KillTree {
         }
         KillTree {
             id,
+            #[cfg(not(windows))]
+            pid,
             #[cfg(windows)]
             job,
         }
@@ -130,6 +141,10 @@ impl KillTree {
         #[cfg(windows)]
         if self.job != 0 {
             win::terminate_job(self.job);
+        }
+        #[cfg(not(windows))]
+        if self.pid != 0 {
+            let _ = unix::kill_pid(self.pid, Duration::from_millis(500));
         }
     }
 }
@@ -218,7 +233,10 @@ fn is_own_image(path: &Path) -> bool {
         .to_string_lossy()
         .to_ascii_lowercase()
         .replace('/', "\\");
-    (name == "aether.exe" || name == "psiphon-tunnel-core.exe")
+    (name == "aether.exe"
+        || name == "psiphon-tunnel-core.exe"
+        || name == "aether"
+        || name == "psiphon-tunnel-core")
         && lower.ends_with(&format!("\\engine\\{name}"))
 }
 
@@ -252,8 +270,7 @@ pub fn listener_pid(port: u16) -> Option<u32> {
     }
     #[cfg(not(windows))]
     {
-        let _ = port;
-        None
+        unix::listener_pid(port)
     }
 }
 
@@ -265,8 +282,7 @@ pub fn image_of(pid: u32) -> Option<PathBuf> {
     }
     #[cfg(not(windows))]
     {
-        let _ = pid;
-        None
+        unix::image_path(pid)
     }
 }
 
@@ -275,12 +291,6 @@ pub fn image_of(pid: u32) -> Option<PathBuf> {
 /// فرزندانِ زندهٔ همین نشست هرگز کشته نمی‌شوند (در زنجیرهٔ Tor → Psiphon،
 /// tor.exe روی ۱۸۲۰ زنده است وقتی موتور برای ۱۸۱۹ آماده می‌شود).
 pub fn reclaim(port: u16) -> Holder {
-    #[cfg(not(windows))]
-    {
-        let _ = port;
-        Holder::Unknown
-    }
-    #[cfg(windows)]
     {
         let Some(pid) = listener_pid(port) else {
             return Holder::Free;
@@ -303,7 +313,11 @@ pub fn reclaim(port: u16) -> Holder {
             .unwrap_or_else(|| format!("PID {pid} (image not readable)"));
         match path.as_deref() {
             Some(p) if is_own_image(p) => {
-                if win::kill_pid(pid, Duration::from_millis(2_500)) {
+                #[cfg(windows)]
+                let killed = win::kill_pid(pid, Duration::from_millis(2_500));
+                #[cfg(not(windows))]
+                let killed = unix::kill_pid(pid, Duration::from_millis(2_500));
+                if killed {
                     DiagnosticsLog::w(
                         TAG,
                         &format!(
@@ -500,7 +514,6 @@ mod win {
                 if size == 0 {
                     return None;
                 }
-                // u32-aligned buffer (the table is an array of u32 fields).
                 let mut buf: Vec<u32> = vec![0; (size as usize + 3) / 4 + 1];
                 let mut len = (buf.len() * 4) as u32;
                 let rc = GetExtendedTcpTable(
@@ -512,7 +525,6 @@ mod win {
                     0,
                 );
                 if rc == 122 {
-                    // ERROR_INSUFFICIENT_BUFFER — the table grew; retry.
                     size = len;
                     continue;
                 }
@@ -528,7 +540,6 @@ mod win {
                     if local_port != port {
                         continue;
                     }
-                    // dwLocalAddr is in network order: 127.0.0.1 → bytes 7f 00 00 01.
                     let addr = row.dwLocalAddr.to_ne_bytes();
                     if addr == [0, 0, 0, 0] || addr[0] == 127 {
                         return Some(row.dwOwningPid);
@@ -576,6 +587,83 @@ mod win {
     }
 }
 
+#[cfg(not(windows))]
+mod unix {
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    pub fn listener_pid(port: u16) -> Option<u32> {
+        let target_hex = format!(":{port:04X}");
+        let mut inodes = Vec::new();
+        for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                for line in text.lines().skip(1) {
+                    let cols: Vec<&str> = line.split_whitespace().collect();
+                    if cols.len() < 10 {
+                        continue;
+                    }
+                    if cols[3] != "0A" {
+                        continue;
+                    }
+                    let local = cols[1];
+                    if !local.ends_with(&target_hex) {
+                        continue;
+                    }
+                    let is_local = local.starts_with("0100007F:")
+                        || local.starts_with("00000000:")
+                        || local.starts_with("00000000000000000000000001000000:")
+                        || local.starts_with("00000000000000000000000000000000:");
+                    if is_local {
+                        inodes.push(format!("socket:[{}]", cols[9]));
+                    }
+                }
+            }
+        }
+        if inodes.is_empty() {
+            return None;
+        }
+        let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+            return None;
+        };
+        for entry in proc_dir.flatten() {
+            let name = entry.file_name();
+            let Some(pid_str) = name.to_str() else { continue };
+            let Ok(pid) = pid_str.parse::<u32>() else { continue };
+            let fd_dir = entry.path().join("fd");
+            let Ok(fds) = std::fs::read_dir(fd_dir) else { continue };
+            for fd in fds.flatten() {
+                if let Ok(target) = std::fs::read_link(fd.path()) {
+                    let t = target.to_string_lossy();
+                    if inodes.iter().any(|ino| t == *ino) {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn image_path(pid: u32) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+
+    pub fn kill_pid(pid: u32, wait: Duration) -> bool {
+        let p = pid.to_string();
+        let _ = Command::new("kill").args(["-TERM", &p]).status();
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = Command::new("kill").args(["-KILL", &p]).status();
+        std::thread::sleep(Duration::from_millis(50));
+        !std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,18 +679,15 @@ mod tests {
         assert!(is_own_image(Path::new(
             r"c:\users\u\appdata\local\STUDIO.CLUVEX.AETHER.DESKTOP\engine\aether.exe"
         )));
-        // Tor Browser's tor.exe, or any other program, is never touched.
         assert!(!is_own_image(Path::new(
             r"C:\Tor Browser\Browser\TorBrowser\Tor\tor.exe"
         )));
         assert!(!is_own_image(Path::new(
             r"C:\Users\U\AppData\Local\studio.cluvex.aether.desktop\engine\other.exe"
         )));
-        // A sibling folder that merely shares the prefix is not ours.
         assert!(!is_own_image(Path::new(
             r"C:\Users\U\AppData\Local\studio.cluvex.aether.desktop-evil\aether.exe"
         )));
-        // An older portable copy of Aether Desktop: its engine folder counts.
         assert!(is_own_image(Path::new(
             r"D:\Downloads\Aether-Portable-1.2.5\engine\psiphon-tunnel-core.exe"
         )));
