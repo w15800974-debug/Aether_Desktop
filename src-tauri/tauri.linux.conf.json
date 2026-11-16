@@ -1,0 +1,54 @@
+{
+  "app": {
+    "windows": [
+      {
+        "additionalBrowserArgs": ""
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "deb",
+      "appimage"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/512x512.png",
+      "icons/icon.png"
+    ],
+    "resources": {
+      "../dist-engine/aether": "engine/aether",
+      "../dist-engine/psiphon-tunnel-core": "engine/psiphon-tunnel-core",
+      "../dist-engine/server_entries.txt": "engine/server_entries.txt",
+      "../dist-engine/xray/xray": "engine/xray/xray",
+      "../dist-engine/tor/tor": "engine/tor/tor",
+      "../dist-engine/tor/geoip": "engine/tor/geoip",
+      "../dist-engine/tor/geoip6": "engine/tor/geoip6",
+      "../dist-engine/pt/lyrebird": "engine/pt/lyrebird",
+      "../dist-engine/pt/pt_config.json": "engine/pt/pt_config.json",
+      "../CORE_VERSION": "engine/CORE_VERSION"
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libayatana-appindicator3-1",
+          "iproute2",
+          "nftables",
+          "libsecret-tools",
+          "zenity"
+        ],
+        "section": "net",
+        "priority": "optional"
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    },
+    "longDescription": "Aether Desktop — the native Linux (Ubuntu) edition of the Aether tunnelling client."
+  }
+}
