@@ -128,7 +128,7 @@ jobs:
 
       - name: Run Rust unit tests (Linux)
         run: |
-          cargo test --manifest-path src-tauri/Cargo.toml --lib
+          cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build Tauri Linux packages (.deb & AppImage)
         run: |
